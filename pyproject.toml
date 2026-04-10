@@ -1,0 +1,10 @@
+[project]
+name = "tavor"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "pandas>=3.0.2",
+    "xlsxwriter>=3.2.9",
+]
