@@ -31,6 +31,12 @@ TAVOR_FILE = "tavor.csv"
 OUT_FILE = "tavor_with_king.xlsx"
 UNMATCHED_FILE = "king_unmatched.xlsx"
 
+# Optional sidecar listing king_code -> article_code ownership lines copied
+# from a tavor import-conflict log ('Штрихкод "X" вже присвоєно "Y NAME"').
+# When present, those assignments override the material_rank heuristic so the
+# dedup matches whatever tavor already considers canonical.
+OWNERS_FILE = "Untitled spreadsheet - Аркуш1.csv"
+
 # (tavor_std_name, leading_numeric) -> (king_std_name, leading_numeric).
 # Used when tavor and king call the same fastener by different standards.
 STANDARD_EQUIVALENCES = {
@@ -80,7 +86,7 @@ def tavor_std_code_variants(code):
     """Yield candidate king std codes for a given tavor Standard Code."""
     if code is None or (isinstance(code, float) and pd.isna(code)):
         return
-    code = str(code).strip()
+    code = str(code).strip().lstrip("~").strip()  # '~6921' = 'similar to 6921'
     if not code:
         return
     seen = set()
@@ -358,6 +364,75 @@ def lookup(row, sized, nut, sized_loose, nut_loose, fine_nut):
     return None
 
 
+def material_rank(item_article, material):
+    """Lower is better. Used to break ties when multiple tavor rows hit the
+    same king code.
+
+    Tavor's 'A2-70' / 'A4-70' / 'A4-80' are the strength grades king implicitly
+    stocks under the bare 'A2' / 'A4' label, so they are preferred over the
+    less common grades (A2-50, A2-035, ...). Plain 'A2' / 'A4' wins outright.
+    """
+    mat = (material or "").upper().strip()
+    if not mat:
+        return 99
+    if re.match(r"^(A[0-9]|AISI\s*\d+)$", mat):
+        return 0
+    for i, suf in enumerate(("-70", "-80", "-50", "-035", "-040")):
+        if mat.endswith(suf):
+            return 1 + i
+    return 50
+
+
+_OWNER_LINE_RE = re.compile(r'"([^"]+)"\s+вже присвоєно\s+"(\d+)\s')
+
+
+def load_owner_map(path):
+    """Parse a conflict log into {king_code: article_code}. Returns {} if the
+    file is absent or unreadable."""
+    try:
+        df = pd.read_csv(path, dtype=str, keep_default_na=False)
+    except (FileNotFoundError, OSError):
+        return {}
+    owners = {}
+    for col in df.columns:
+        for cell in df[col]:
+            m = _OWNER_LINE_RE.search(str(cell))
+            if m:
+                owners.setdefault(m.group(1), m.group(2))
+    return owners
+
+
+def dedupe_matches(tavor_df, owners):
+    """Drop matches so each king code maps to at most one tavor row.
+
+    If `owners[king_code]` exists, the row whose Article code matches wins.
+    Otherwise fall back to material_rank.
+
+    Returns the count of rows whose King columns were cleared.
+    """
+    mask = tavor_df["King Code"].astype(str) != ""
+    if not mask.any():
+        return 0
+    matched = tavor_df.loc[mask].copy()
+    matched["_rank"] = [
+        material_rank(a, m)
+        for a, m in zip(matched["Item article"], matched["Material"])
+    ]
+    # Boost owner-designated rows above any heuristic winner.
+    matched["_owner_rank"] = [
+        0 if owners.get(kc) == ac else 1
+        for kc, ac in zip(matched["King Code"], matched["Article code"])
+    ]
+    matched = matched.sort_values(
+        ["King Code", "_owner_rank", "_rank"], kind="stable"
+    )
+    winners = matched.drop_duplicates("King Code", keep="first").index
+    losers = matched.index.difference(winners)
+    if len(losers):
+        tavor_df.loc[losers, ["King Name", "King Size", "King Code"]] = ""
+    return len(losers)
+
+
 def main():
     print(f"Loading {KING_FILE} and {TAVOR_FILE}...")
     king_df = pd.read_csv(
@@ -412,6 +487,13 @@ def main():
     tavor_df["King Name"] = king_names
     tavor_df["King Size"] = king_sizes
     tavor_df["King Code"] = king_codes
+
+    owners = load_owner_map(OWNERS_FILE)
+    if owners:
+        print(f"Loaded {len(owners)} owner assignments from {OWNERS_FILE!r}.")
+    dropped = dedupe_matches(tavor_df, owners)
+    matched -= dropped
+    print(f"Enforcing one-to-one: cleared {dropped} duplicate matches.")
 
     print(f"Writing {OUT_FILE}...")
     with pd.ExcelWriter(OUT_FILE, engine="xlsxwriter") as writer:
